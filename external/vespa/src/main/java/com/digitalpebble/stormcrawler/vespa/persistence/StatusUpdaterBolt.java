@@ -20,6 +20,7 @@ package com.digitalpebble.stormcrawler.vespa.persistence;
 import java.time.Instant;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
@@ -100,7 +101,7 @@ public class StatusUpdaterBolt extends AbstractStatusUpdaterBolt
 		String docId = org.apache.commons.codec.digest.DigestUtils.sha256Hex(url);
 
 		// need to synchronize: otherwise it might get added to the cache
-		// without having been sent to ES
+		// without having been sent to the backend
 		synchronized (waitAck) {
 			// check that the same URL is not being sent to ES
 			List<Tuple> alreadySent = waitAck.getIfPresent(docId);
@@ -121,6 +122,25 @@ public class StatusUpdaterBolt extends AbstractStatusUpdaterBolt
 
 		String ts = Long.toString(Instant.now().getEpochSecond());
 
+		LinkedHashMap<String, Object> map = new LinkedHashMap<>();
+
+		// need to use an update for discovered
+		// at least until https://github.com/vespa-engine/vespa/issues/16209
+		// is resolved
+		if (status.equals(Status.DISCOVERED)) {
+			// It should be possible to do what you're looking for by using updates with
+			// create: true set in conjunction with a condition that always fails if the
+			// document does exist (e.g. just "false"). The condition is explicitly ignored
+			// iff the document does not exist and the create-flag is set.
+			map.put("update", "id:url:url::" + docId);
+			map.put("condition", "url.url==IMPOSSIBLEVALUE");
+			map.put("create", true);
+		}
+		// just override any existing value
+		else {
+			map.put("put", "id:url:url::" + docId);
+		}
+
 		Map<String, Object> fields = new HashMap<>();
 
 		fields.put("url", url);
@@ -128,15 +148,8 @@ public class StatusUpdaterBolt extends AbstractStatusUpdaterBolt
 		fields.put("key", partitionKey);
 		fields.put("next_fetch_date", ts);
 		fields.put("metadata", metadata.asMap());
-		
-		Map<String, Object> map = new HashMap<>();
 
 		map.put("fields", fields);
-
-		map.put("update", "id:url:url::" + docId);
-
-		// TODO needs fixing so that a DISCOVERY never OVERWRITES ANOTHER STATUS
-		map.put("create", true);
 
 		String jsonResult = mapper.writeValueAsString(map);
 
