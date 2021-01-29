@@ -26,6 +26,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
+import org.apache.storm.metric.api.MultiReducedMetric;
+import org.apache.storm.metric.api.ReducedMetric;
 import org.apache.storm.task.OutputCollector;
 import org.apache.storm.task.TopologyContext;
 import org.apache.storm.tuple.Tuple;
@@ -36,6 +38,7 @@ import com.digitalpebble.stormcrawler.Metadata;
 import com.digitalpebble.stormcrawler.persistence.AbstractStatusUpdaterBolt;
 import com.digitalpebble.stormcrawler.persistence.Status;
 import com.digitalpebble.stormcrawler.util.ConfUtils;
+import com.digitalpebble.stormcrawler.util.PerSecondReducer;
 import com.digitalpebble.stormcrawler.util.URLPartitioner;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.cache.Cache;
@@ -45,6 +48,7 @@ import com.google.common.cache.RemovalNotification;
 import com.yahoo.vespa.http.client.FeedClient;
 import com.yahoo.vespa.http.client.FeedClientFactory;
 import com.yahoo.vespa.http.client.Result;
+import com.yahoo.vespa.http.client.Result.Detail;
 import com.yahoo.vespa.http.client.config.Cluster;
 import com.yahoo.vespa.http.client.config.ConnectionParams;
 import com.yahoo.vespa.http.client.config.Endpoint;
@@ -64,6 +68,8 @@ public class StatusUpdaterBolt extends AbstractStatusUpdaterBolt
 	private URLPartitioner partitioner;
 
 	private Cache<String, List<Tuple>> waitAck;
+
+	private ReducedMetric perSecMetrics;
 
 	public StatusUpdaterBolt() {
 		super();
@@ -88,6 +94,9 @@ public class StatusUpdaterBolt extends AbstractStatusUpdaterBolt
 		partitioner.configure(stormConf);
 
 		waitAck = CacheBuilder.newBuilder().expireAfterWrite(60, TimeUnit.SECONDS).removalListener(this).build();
+
+		this.perSecMetrics = context.registerMetric("sent_average_persec", new ReducedMetric(new PerSecondReducer()),
+				60);
 	}
 
 	@Override
@@ -124,6 +133,8 @@ public class StatusUpdaterBolt extends AbstractStatusUpdaterBolt
 
 		LinkedHashMap<String, Object> map = new LinkedHashMap<>();
 
+		Map<String, Object> fields = new HashMap<>();
+
 		// need to use an update for discovered
 		// at least until https://github.com/vespa-engine/vespa/issues/16209
 		// is resolved
@@ -133,21 +144,34 @@ public class StatusUpdaterBolt extends AbstractStatusUpdaterBolt
 			// document does exist (e.g. just "false"). The condition is explicitly ignored
 			// iff the document does not exist and the create-flag is set.
 			map.put("update", "id:url:url::" + docId);
-			map.put("condition", "url.url==IMPOSSIBLEVALUE");
+			map.put("condition", "url.url=='IMPOSSIBLEVALUE'");
 			map.put("create", true);
+			// need assigns
+			HashMap a1 = new HashMap(1);
+			a1.put("assign", url);
+			fields.put("url", a1);
+			HashMap a2 = new HashMap(1);
+			a2.put("assign", status.toString());
+			fields.put("status", a2);
+			HashMap a3 = new HashMap(1);
+			a3.put("assign", partitionKey);
+			fields.put("key", a3);
+			HashMap a4 = new HashMap(1);
+			a4.put("assign", ts);
+			fields.put("next_fetch_date", a4);
+			HashMap a5 = new HashMap(1);
+			a5.put("assign", metadata.asMap());
+			fields.put("metadata", a5);
 		}
 		// just override any existing value
 		else {
 			map.put("put", "id:url:url::" + docId);
+			fields.put("url", url);
+			fields.put("status", status.toString());
+			fields.put("key", partitionKey);
+			fields.put("next_fetch_date", ts);
+			fields.put("metadata", metadata.asMap());
 		}
-
-		Map<String, Object> fields = new HashMap<>();
-
-		fields.put("url", url);
-		fields.put("status", status.toString());
-		fields.put("key", partitionKey);
-		fields.put("next_fetch_date", ts);
-		fields.put("metadata", metadata.asMap());
 
 		map.put("fields", fields);
 
@@ -177,22 +201,35 @@ public class StatusUpdaterBolt extends AbstractStatusUpdaterBolt
 
 	@Override
 	public void onCompletion(String id, Result documentResult) {
-		List<Tuple> xx = waitAck.getIfPresent(id);
-		if (xx != null) {
-			LOG.debug("Acked {} tuple(s) for ID {}", xx.size(), id);
-			for (Tuple x : xx) {
-				if (documentResult.isSuccess()) {
-					String url = x.getStringByField("url");
-					// ack and put in cache
-					LOG.debug("Acked {} with ID {}", url, id);
-					super.ack(x, url);
-				} else {
-					_collector.fail(x);
+		this.perSecMetrics.update(1);
+		boolean success = documentResult.isSuccess();
+		if (!success) {
+			for (Detail d : documentResult.getDetails()) {
+				if (d.getResultType().name().equals("CONDITION_NOT_MET")) {
+					success = true;
 				}
+				break;
 			}
-			waitAck.invalidate(id);
-		} else {
-			LOG.warn("Could not find unacked tuple for {}", id);
+		}
+		synchronized (waitAck) {
+			List<Tuple> xx = waitAck.getIfPresent(id);
+			if (xx != null) {
+				LOG.debug("Acked {} tuple(s) for ID {}", xx.size(), id);
+				for (Tuple x : xx) {
+					if (success) {
+						String url = x.getStringByField("url");
+						// ack and put in cache
+						LOG.debug("Acked {} with ID {}", url, id);
+						super.ack(x, url);
+					} else {
+						LOG.error("Failure reported by Vespa: {}", documentResult);
+						_collector.fail(x);
+					}
+				}
+				waitAck.invalidate(id);
+			} else {
+				LOG.warn("Could not find unacked tuple for {}", id);
+			}
 		}
 	}
 }
